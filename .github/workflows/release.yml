@@ -1,0 +1,91 @@
+name: Release APK
+
+'on':
+  push:
+    tags:
+      - 'v*'
+  # El re-run de un run cancelado se queda en queued sin runner; este disparo
+  # manual permite publicar sin depender de eso.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag ya creado en el repo (sin la v, p. ej. 0.24.1-es.5)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/v{0}', inputs.tag) || github.ref }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+        with:
+          # The legacy `tools` package is no longer published. Asking for it makes
+          # current hosted runners fail before Gradle starts.
+          packages: platform-tools
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Restore required release signing keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE }}
+          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          for name in KEYSTORE_B64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing required release signing secret: $name"
+              exit 1
+            fi
+          done
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          test -s "$RUNNER_TEMP/release.keystore"
+
+      # The tag is the single source of the shipped version; see app/build.gradle.kts.
+      - name: Derive version from tag
+        run: echo "DSH_VERSION_NAME=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_ENV"
+
+      - name: Unit tests
+        run: ./gradlew :core:jvmTest :mock-harness:test :app:testReleaseUnitTest --stacktrace
+
+      - name: Build release APK
+        env:
+          DSH_KEYSTORE: ${{ runner.temp }}/release.keystore
+          DSH_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          DSH_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          DSH_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: ./gradlew :app:assembleRelease --stacktrace
+
+      - name: Release lint
+        run: ./gradlew :app:lintRelease --stacktrace
+
+      - name: Verify release signature
+        run: |
+          APK=app/build/outputs/apk/release/app-release.apk
+          test -f "$APK"
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          "$APKSIGNER" verify --verbose "$APK"
+
+      - name: Checksums
+        run: |
+          cd app/build/outputs/apk/release
+          sha256sum *.apk > SHA256SUMS.txt
+          ls -la
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/release/SHA256SUMS.txt
+          generate_release_notes: true

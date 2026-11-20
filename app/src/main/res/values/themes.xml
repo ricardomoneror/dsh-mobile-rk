@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.DshMobile" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+    </style>
+    <!--
+        The manifest theme, so it is what the window starts with on *every* creation of the
+        activity — including the recreate that applying a language forces, which happens long after
+        any splash. It follows the same window token as the post-splash theme, so there is no flash.
+    -->
+    <style name="Theme.DshMobile.Starting" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/window_background</item>
+        <item name="android:windowBackground">@color/window_background</item>
+        <!-- The mascot, not the launcher icon: the launch moment is the one place the character introduces the app. -->
+        <item name="windowSplashScreenAnimatedIcon">@drawable/mascot_mark</item>
+        <item name="windowSplashScreenIconBackgroundColor">@color/window_background</item>
+        <item name="postSplashScreenTheme">@style/Theme.DshMobile</item>
+    </style>
+</resources>

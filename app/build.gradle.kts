@@ -1,0 +1,201 @@
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.ksp)
+    alias(libs.plugins.hilt)
+}
+
+/**
+ * The release version, taken from the git tag the release workflow is building.
+ *
+ * `DSH_VERSION_NAME` is the tag without its leading `v`. Hardcoding it here meant every tag after
+ * the first shipped an APK still claiming to be the first — same `versionCode`, so Android saw no
+ * upgrade at all. The code is derived from the name so it rises with semver on its own; the
+ * fallback is what a local `assembleRelease` builds.
+ */
+val dshVersionName: String = System.getenv("DSH_VERSION_NAME")?.takeIf { it.isNotBlank() } ?: "0.24.0"
+
+val dshVersionCode: Int = dshVersionName
+    .substringBefore('-')
+    .split('.')
+    .mapNotNull { it.toIntOrNull() }
+    .let { parts ->
+        val major = parts.getOrElse(0) { 0 }
+        val minor = parts.getOrElse(1) { 0 }
+        val patch = parts.getOrElse(2) { 0 }
+        major * 10_000 + minor * 100 + patch
+    }
+    .coerceAtLeast(1)
+
+android {
+    namespace = "com.labteto.dshmobile"
+    compileSdk = 35
+
+    defaultConfig {
+        // fork: applicationId propio para convivir con la app original (com.labteto.dshmobile)
+        applicationId = "com.ricardo.dshmobile"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = dshVersionCode
+        versionName = dshVersionName
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        vectorDrawables { useSupportLibrary = true }
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+        }
+        release {
+            isMinifyEnabled = false
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
+
+    // Optional release signing: provide DSH_KEYSTORE / DSH_KEYSTORE_PASSWORD /
+    // DSH_KEY_ALIAS / DSH_KEY_PASSWORD (env vars, e.g. from GitHub secrets).
+    // Signing activates only when the keystore file actually exists, so a
+    // missing keystore silently falls back to an unsigned release APK.
+    signingConfigs {
+        val keystore = System.getenv("DSH_KEYSTORE")
+        if (!keystore.isNullOrBlank() && file(keystore).exists()) {
+            create("release") {
+                storeFile = file(keystore)
+                storePassword = System.getenv("DSH_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("DSH_KEY_ALIAS")
+                keyPassword = System.getenv("DSH_KEY_PASSWORD")
+            }
+            buildTypes.getByName("release") {
+                signingConfig = signingConfigs.getByName("release")
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
+
+    packaging {
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+        jniLibs {
+            // The built-in harness runtime execs proot (`libproot.so`, `libproot-loader.so`) from
+            // nativeLibraryDir: the one app-owned place a targetSdk 29+ app may execve() from. That needs
+            // the libraries extracted at install time, which is what legacy packaging does.
+            useLegacyPackaging = true
+            // Vendored and already stripped; their bytes must stay the ones `app/third_party/proot`
+            // records. The loader is a static executable that strip has no business touching.
+            keepDebugSymbols += listOf("**/libproot.so", "**/libproot-loader.so")
+            // zstd-jni ships 32-bit code too, but the runtime has no 32-bit build: a device without a
+            // 64-bit ABI reports NotSupported and never loads it.
+            excludes += listOf("lib/armeabi-v7a/libzstd-jni*.so", "lib/x86/libzstd-jni*.so")
+        }
+    }
+
+    lint {
+        // The 11-language claim is only true while every base string has a translation, and the
+        // gap is invisible in review — this is the check that actually enforces it, so it is
+        // pinned rather than left to the default severity.
+        error += listOf("MissingTranslation", "ImpliedQuantity")
+        // `HardcodedText` is deliberately absent: it only inspects XML layouts, and this app has
+        // none. Compose string literals have to be caught in review.
+    }
+}
+
+dependencies {
+    implementation(project(":core")) {
+        // `:core` carries Ktor for the iOS transport (`KtorRpcTransport`, `KtorMuxSocket`). The
+        // Android app keeps using OkHttp and never loads those classes, and release minification is
+        // off, so leaving Ktor on the runtime classpath would ship its client, utils and HTTP
+        // modules in every APK for nothing. The classes in `:core` that mention Ktor are never
+        // touched by the app, so the missing jars are never looked up. That is not left to care:
+        // `:core`'s NoKtorOnTheAppPathTest fails if any class outside the Ktor island can reach one.
+        exclude(group = "io.ktor")
+    }
+    // The Compose UI both apps share. Same Ktor rule as `:core` above, for the same reason: this
+    // module's `iosMain` carries the Ktor wiring, the Android variant carries none of it, and what
+    // reaches Ktor through `:core` must not ride in on this edge either.
+    implementation(project(":sharedUi")) {
+        exclude(group = "io.ktor")
+    }
+    implementation("org.yaml:snakeyaml:2.5")
+    // The built-in harness runtime: manifest signature (Ed25519 below API 33) and layer decompression.
+    implementation(libs.eddsa)
+    implementation(libs.zstd.jni) {
+        // The AAR, not the desktop jar: that one carries native code for every desktop OS.
+        artifact { type = "aar" }
+    }
+
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.lifecycle.service)
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.core.splashscreen)
+    implementation(libs.androidx.appcompat)
+    // Folds, hinges and postures for the adaptive shell (see ui/adaptive).
+    implementation(libs.androidx.window)
+    implementation(libs.androidx.window.core)
+
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.ui.graphics)
+    implementation(libs.androidx.compose.ui.tooling.preview)
+    implementation(libs.androidx.compose.material3)
+    implementation(libs.androidx.compose.material.icons.extended)
+    implementation(libs.androidx.compose.foundation)
+    implementation(libs.androidx.navigation.compose)
+    implementation(libs.androidx.hilt.navigation.compose)
+
+    implementation(libs.hilt.android)
+    ksp(libs.hilt.compiler)
+
+    implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.kotlinx.serialization.json)
+    implementation(libs.okhttp)
+    implementation(libs.okhttp.logging)
+    implementation(libs.androidx.datastore.preferences)
+    implementation(libs.androidx.work.runtime.ktx)
+    // QR scanning for relay pairing. ZXing rather than ML Kit: it needs no Google Play Services, so
+    // it works on a de-Googled device, and pairing is the one flow a user cannot route around.
+    implementation(libs.zxing.android.embedded)
+
+    testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
+    // A real HTTP server for two kinds of tests: the runtime installer serves a signed release
+    // over HTTPS from it, and the in-app updater tests ranges, redirects and dropped connections.
+    testImplementation(libs.okhttp.mockwebserver)
+    testImplementation(libs.okhttp.tls)
+    // The mock harness carries this project's port of the host's answer-acceptance law. The
+    // conformance test runs the real encoder through it rather than through a copy, because a copy
+    // is a second thing to keep in step and the failure it guards against is a silent one.
+    testImplementation(project(":mock-harness"))
+    // The app's own build keeps Ktor out of `:core`'s runtime classpath (see above); the
+    // end-to-end tests run the Ktor transport against the mock harness too, so they bring it back.
+    testImplementation(libs.ktor.client.core)
+    testImplementation(libs.ktor.client.cio)
+    androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+    androidTestImplementation(libs.androidx.test.runner)
+    // `FoldingFeature(...)` and `WindowLayoutInfoPublisherRule`: drive a fold or a half-open hinge
+    // into the running activity's WindowInfoTracker without a foldable.
+    androidTestImplementation(libs.androidx.window.testing)
+    debugImplementation(libs.androidx.compose.ui.tooling)
+    debugImplementation(libs.androidx.compose.ui.test.manifest)
+}
